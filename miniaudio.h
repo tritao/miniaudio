@@ -10830,7 +10830,7 @@ MA_API ma_result ma_node_set_time(ma_node* pNode, ma_uint64 localTime);
 typedef struct
 {
     ma_uint32 channels;
-    ma_uint32 processingSizeInFrames;   /* This is the preferred processing size for node processing callbacks unless overridden by a node itself. Can be 0 in which case it will be based on the frame count passed into ma_node_graph_read_pcm_frames(), but will not be well defined. */
+    ma_uint32 processingSizeInFrames;   /* This is the preferred processing size for node processing callbacks unless overridden by a node itself. Can be 0 to select the default node cache size. The maximum is 65535. A fixed processing size keeps splitter branches synchronized across variable caller read sizes. */
     size_t preMixStackSizeInBytes;      /* Defaults to 512KB per channel. Reducing this will save memory, but the depth of your node graph will be more restricted. */
 } ma_node_graph_config;
 
@@ -10900,6 +10900,11 @@ MA_API ma_splitter_node_config ma_splitter_node_config_init(ma_uint32 channels);
 typedef struct
 {
     ma_node_base base;
+
+    /* Audio thread only. Output routes share one cache indexed by graph time. */
+    ma_uint64 cachedGlobalTime;
+    ma_uint32 cachedFrameCount;
+    ma_bool32 isCacheValid;
 } ma_splitter_node;
 
 MA_API ma_result ma_splitter_node_init(ma_node_graph* pNodeGraph, const ma_splitter_node_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_splitter_node* pSplitterNode);
@@ -73606,6 +73611,17 @@ static void ma_stack_free(ma_stack* pStack, void* p)
 #define MA_DEFAULT_PREMIX_STACK_SIZE_PER_CHANNEL    524288
 #endif
 
+static void ma_splitter_node_process_pcm_frames(ma_node* pNode, const float** ppFramesIn, ma_uint32* pFrameCountIn, float** ppFramesOut, ma_uint32* pFrameCountOut);
+
+static ma_node_vtable g_ma_splitter_node_vtable =
+{
+    ma_splitter_node_process_pcm_frames,
+    NULL,
+    1,
+    MA_NODE_BUS_COUNT_UNKNOWN,
+    0
+};
+
 static ma_result ma_node_read_pcm_frames(ma_node* pNode, ma_uint32 outputBusIndex, float* pFramesOut, ma_uint32 frameCount, ma_uint32* pFramesRead, ma_uint64 globalTime);
 
 MA_API void ma_debug_fill_pcm_frames_with_sine_wave(float* pFramesOut, ma_uint32 frameCount, ma_format format, ma_uint32 channels, ma_uint32 sampleRate)
@@ -73731,8 +73747,12 @@ MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const m
         return MA_INVALID_ARGS;
     }
 
+    if (pConfig->processingSizeInFrames > 0xFFFF) {
+        return MA_INVALID_ARGS; /* Per-node caches use 16-bit frame counts. */
+    }
+
     MA_ZERO_OBJECT(pNodeGraph);
-    pNodeGraph->processingSizeInFrames = pConfig->processingSizeInFrames;
+    pNodeGraph->processingSizeInFrames = pConfig->processingSizeInFrames != 0 ? pConfig->processingSizeInFrames : MA_DEFAULT_NODE_CACHE_CAP_IN_FRAMES_PER_BUS;
 
     /* Base node so we can use the node graph as a node into another graph. */
     baseConfig = ma_node_config_init();
@@ -73759,8 +73779,8 @@ MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const m
 
 
     /* Processing cache. */
-    if (pConfig->processingSizeInFrames > 0) {
-        pNodeGraph->pProcessingCache = (float*)ma_malloc(pConfig->processingSizeInFrames * pConfig->channels * sizeof(float), pAllocationCallbacks);
+    if (pNodeGraph->processingSizeInFrames > 0) {
+        pNodeGraph->pProcessingCache = (float*)ma_malloc(pNodeGraph->processingSizeInFrames * pConfig->channels * sizeof(float), pAllocationCallbacks);
         if (pNodeGraph->pProcessingCache == NULL) {
             ma_node_uninit(&pNodeGraph->endpoint, pAllocationCallbacks);
             ma_node_uninit(&pNodeGraph->base, pAllocationCallbacks);
@@ -75165,6 +75185,62 @@ static void ma_node_process_pcm_frames_internal(ma_node* pNode, const float** pp
     }
 }
 
+/*
+Splitter outputs can be attached, stopped or read in a different order independently.
+The generic output-bus read flags cannot identify which graph interval an unread
+output belongs to. Keep the input samples until their graph interval has elapsed,
+then pull the next interval once, regardless of which output requests it first.
+Prefetching a full node cache also allows differently sized downstream reads to
+share samples. All allocations were made by ma_node_init().
+*/
+static ma_result ma_node_read_pcm_frames__splitter(ma_splitter_node* pSplitter, ma_uint32 outputBusIndex, float* pFramesOut, ma_uint32 frameCount, ma_uint32* pFramesRead, ma_uint64 globalTime)
+{
+    ma_node_base* pBase = &pSplitter->base;
+    ma_uint32 channels = ma_node_get_output_channels(pBase, outputBusIndex);
+    float* pCache = ma_node_get_cached_input_ptr(pBase, 0);
+    ma_uint32 framesToRead;
+    ma_uint32 framesRead;
+    ma_uint32 offset;
+    ma_uint64 cacheTime;
+    ma_result result;
+
+    *pFramesRead = 0;
+    if (frameCount == 0) {
+        return MA_SUCCESS;
+    }
+
+    if (!pSplitter->isCacheValid || globalTime < pSplitter->cachedGlobalTime ||
+        globalTime - pSplitter->cachedGlobalTime >= pSplitter->cachedFrameCount) {
+        cacheTime = pSplitter->isCacheValid ? globalTime : ma_node_graph_get_time(pBase->pNodeGraph);
+        /* Large graph reads can visit this node several times before the endpoint clock advances. */
+        if (globalTime < cacheTime || globalTime - cacheTime >= pBase->cachedDataCapInFramesPerBus) {
+            cacheTime = globalTime;
+        }
+        framesToRead = pBase->cachedDataCapInFramesPerBus;
+        result = ma_node_input_bus_read_pcm_frames(pBase, &pBase->pInputBuses[0], pCache, framesToRead, &framesRead, cacheTime);
+        if (result != MA_SUCCESS && result != MA_AT_END) {
+            return result;
+        }
+        if (framesRead < framesToRead) {
+            ma_silence_pcm_frames(pCache + framesRead * channels, framesToRead - framesRead, ma_format_f32, channels);
+        }
+        pSplitter->cachedGlobalTime = cacheTime;
+        pSplitter->cachedFrameCount = framesToRead;
+        pSplitter->isCacheValid = MA_TRUE;
+        /* Advancing the source advances this clock once, rather than once per output. */
+        ma_atomic_fetch_add_64(&pBase->localTime, framesToRead);
+    }
+
+    offset = (ma_uint32)(globalTime - pSplitter->cachedGlobalTime);
+    framesRead = ma_min(frameCount, pSplitter->cachedFrameCount - offset);
+    if (pFramesOut != NULL) {
+        ma_copy_pcm_frames(pFramesOut, pCache + offset * channels, framesRead, ma_format_f32, channels);
+        ma_apply_volume_factor_f32(pFramesOut, framesRead * channels, ma_node_output_bus_get_volume(&pBase->pOutputBuses[outputBusIndex]));
+    }
+    *pFramesRead = framesRead;
+    return MA_SUCCESS;
+}
+
 static ma_result ma_node_read_pcm_frames(ma_node* pNode, ma_uint32 outputBusIndex, float* pFramesOut, ma_uint32 frameCount, ma_uint32* pFramesRead, ma_uint64 globalTime)
 {
     ma_node_base* pNodeBase = (ma_node_base*)pNode;
@@ -75238,6 +75314,7 @@ static ma_result ma_node_read_pcm_frames(ma_node* pNode, ma_uint32 outputBusInde
         ma_silence_pcm_frames(pFramesOut, timeOffsetBeg, ma_format_f32, ma_node_get_output_channels(pNode, outputBusIndex));
         pFramesOut += timeOffsetBeg * ma_node_get_output_channels(pNode, outputBusIndex);
         frameCount -= timeOffsetBeg;
+        globalTime += timeOffsetBeg;
     }
 
     /* Trim based on the end offset. We don't need to silence the tail section because we'll just have a reduced value written to pFramesRead. */
@@ -75250,6 +75327,13 @@ static ma_result ma_node_read_pcm_frames(ma_node* pNode, ma_uint32 outputBusInde
         frameCount -= timeOffsetEnd;
     }
 
+
+    if (pNodeBase->vtable == &g_ma_splitter_node_vtable) {
+        result = ma_node_read_pcm_frames__splitter((ma_splitter_node*)pNode, outputBusIndex,
+            pFramesOut, frameCount, &totalFramesRead, globalTime);
+        *pFramesRead = totalFramesRead + timeOffsetBeg;
+        return result;
+    }
 
     /* We run on different paths depending on the bus counts. */
     inputBusCount  = ma_node_get_input_bus_count(pNode);
@@ -75710,14 +75794,7 @@ static void ma_splitter_node_process_pcm_frames(ma_node* pNode, const float** pp
     }
 }
 
-static ma_node_vtable g_ma_splitter_node_vtable =
-{
-    ma_splitter_node_process_pcm_frames,
-    NULL,                       /* onGetRequiredInputFrameCount */
-    1,                          /* 1 input bus. */
-    MA_NODE_BUS_COUNT_UNKNOWN,  /* The output bus count is specified on a per-node basis. */
-    0
-};
+
 
 MA_API ma_result ma_splitter_node_init(ma_node_graph* pNodeGraph, const ma_splitter_node_config* pConfig, const ma_allocation_callbacks* pAllocationCallbacks, ma_splitter_node* pSplitterNode)
 {
