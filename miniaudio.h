@@ -74133,6 +74133,20 @@ static void ma_node_input_bus_detach__no_output_bus_lock(ma_node_input_bus* pInp
     ma_node_output_bus_set_is_attached(pOutputBus, MA_FALSE);
 
     /*
+    A reader which already selected this bus still needs its next link to finish
+    the input iteration. Keep the bus in the list until that reader has advanced.
+    New iterations skip it because isAttached is false. Drain selection first so
+    a reader which observed the old flag can finish incrementing its reference.
+    These waits run only on the mutating thread; audio traversal never locks.
+    */
+    while (ma_node_input_bus_get_next_counter(pInputBus) > 0) {
+        ma_yield();
+    }
+    while (ma_atomic_load_32(&pOutputBus->refCount) > 0) {
+        ma_yield();
+    }
+
+    /*
     We cannot use the output bus lock here since it'll be getting used at a higher level, but we do
     still need to use the input bus lock since we'll be updating pointers on two different output
     buses. The same rules apply here as the attaching case. Although we're using a lock here, we're
@@ -74158,40 +74172,17 @@ static void ma_node_input_bus_detach__no_output_bus_lock(ma_node_input_bus* pInp
     }
     ma_node_input_bus_unlock(pInputBus);
 
+    /* An iteration may have loaded this now-unlinked bus while skipping detached
+       entries. Let it finish following the next link before clearing/freeing it. */
+    while (ma_node_input_bus_get_next_counter(pInputBus) > 0) {
+        ma_yield();
+    }
+
     /* At this point the output bus is detached and the linked list is completely unaware of it. Reset some data for safety. */
     ma_atomic_exchange_ptr(&pOutputBus->pNext, NULL);   /* Using atomic exchanges here, mainly for the benefit of analysis tools which don't always recognize spinlocks. */
     ma_atomic_exchange_ptr(&pOutputBus->pPrev, NULL);   /* As above. */
     pOutputBus->pInputNode             = NULL;
     pOutputBus->inputNodeInputBusIndex = 0;
-
-
-    /*
-    For thread-safety reasons, we don't want to be returning from this straight away. We need to
-    wait for the audio thread to finish with the output bus. There's two things we need to wait
-    for. The first is the part that selects the next output bus in the list, and the other is the
-    part that reads from the output bus. Basically all we're doing is waiting for the input bus
-    to stop referencing the output bus.
-
-    We're doing this part last because we want the section above to run while the audio thread
-    is finishing up with the output bus, just for efficiency reasons. We marked the output bus as
-    detached right at the top of this function which is going to prevent the audio thread from
-    iterating the output bus again.
-    */
-
-    /* Part 1: Wait for the current iteration to complete. */
-    while (ma_node_input_bus_get_next_counter(pInputBus) > 0) {
-        ma_yield();
-    }
-
-    /* Part 2: Wait for any reads to complete. */
-    while (ma_atomic_load_32(&pOutputBus->refCount) > 0) {
-        ma_yield();
-    }
-
-    /*
-    At this point we're done detaching and we can be guaranteed that the audio thread is not going
-    to attempt to reference this output bus again (until attached again).
-    */
 }
 
 #if 0   /* Not used at the moment, but leaving here in case I need it later. */
@@ -74215,11 +74206,11 @@ static void ma_node_input_bus_attach(ma_node_input_bus* pInputBus, ma_node_outpu
 
     ma_node_output_bus_lock(pOutputBus);
     {
-        ma_node_output_bus* pOldInputNode = (ma_node_output_bus*)ma_atomic_load_ptr(&pOutputBus->pInputNode);
+        ma_node_base* pOldInputNode = (ma_node_base*)ma_atomic_load_ptr(&pOutputBus->pInputNode);
 
         /* Detach from any existing attachment first if necessary. */
         if (pOldInputNode != NULL) {
-            ma_node_input_bus_detach__no_output_bus_lock(pInputBus, pOutputBus);
+            ma_node_input_bus_detach__no_output_bus_lock(&pOldInputNode->pInputBuses[pOutputBus->inputNodeInputBusIndex], pOutputBus);
         }
 
         /*
